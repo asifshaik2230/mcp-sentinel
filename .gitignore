@@ -1,0 +1,27 @@
+# MCP-Sentinel — ignore build artifacts and local secrets
+.target/
+*.class
+*.jar
+*.war
+*.iml
+.idea/
+.vscode/
+*.log
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Data / local H2
+data/
+*.db
+*.mv.db
+*.trace.db
+
+# Maven
+mcp-proxy/target/

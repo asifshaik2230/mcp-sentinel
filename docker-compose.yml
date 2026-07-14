@@ -1,0 +1,46 @@
+services:
+  mcp-proxy:
+    build:
+      context: ./mcp-proxy
+      dockerfile: Dockerfile
+    container_name: mcp-sentinel-proxy
+    ports:
+      - "8080:8080"
+    volumes:
+      - sentinel-data:/data
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:h2:file:/data/mcp_sentinel;DB_CLOSE_DELAY=-1;MODE=PostgreSQL
+      JAVA_OPTS: -XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    restart: unless-stopped
+    networks:
+      - sentinel-net
+
+  security-dashboard:
+    build:
+      context: ./security-dashboard
+      dockerfile: Dockerfile
+    container_name: mcp-sentinel-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      PROXY_BASE_URL: http://mcp-proxy:8080
+      DASHBOARD_REFRESH_SECONDS: "5"
+    depends_on:
+      mcp-proxy:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - sentinel-net
+
+volumes:
+  sentinel-data:
+
+networks:
+  sentinel-net:
+    driver: bridge
