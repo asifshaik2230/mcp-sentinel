@@ -1,6 +1,7 @@
 package com.mcpsentinel.proxy.security;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -8,41 +9,92 @@ import java.util.regex.Pattern;
 /**
  * Zero-trust rule engine for inspecting MCP tool-call payloads.
  *
- * RULE 1 — Block dangerous tools: bash, shell, execute_command
- * RULE 2 — Block prompt-injection / shell-piping patterns in the payload
+ * <ul>
+ *   <li>OWASP MCP03 / MCP05 — Tool poisoning &amp; command injection</li>
+ *   <li>Blocks unauthorized shell tools and path traversal</li>
+ * </ul>
  */
 public final class SecurityRuleEngine {
 
     public static final Set<String> BLOCKED_TOOLS = Set.of(
             "bash",
             "shell",
-            "execute_command"
+            "execute_command",
+            "exec",
+            "run_terminal",
+            "terminal"
     );
 
-    private static final List<ThreatPattern> THREAT_PATTERNS = List.of(
+    private static final List<ThreatPattern> POISONING_PATTERNS = List.of(
+            new ThreatPattern(
+                    Pattern.compile("(?i)ignore\\s+(all\\s+)?(previous|prior|above)\\s+(instructions?|prompts?|rules?)"),
+                    RejectionReason.TOOL_POISONING_DETECTED
+            ),
+            new ThreatPattern(
+                    Pattern.compile("(?i)system\\s+override"),
+                    RejectionReason.TOOL_POISONING_DETECTED
+            ),
+            new ThreatPattern(
+                    Pattern.compile("(?i)(you\\s+are\\s+now\\s+|DAN\\s+mode|jailbreak)"),
+                    RejectionReason.TOOL_POISONING_DETECTED
+            ),
+            new ThreatPattern(
+                    Pattern.compile("(?i)disregard\\s+(your\\s+)?(safety|system)\\s+(guidelines?|prompt)"),
+                    RejectionReason.TOOL_POISONING_DETECTED
+            ),
+            new ThreatPattern(
+                    Pattern.compile("(?i)<\\s*/?\\s*system\\s*>"),
+                    RejectionReason.TOOL_POISONING_DETECTED
+            ),
+            new ThreatPattern(
+                    Pattern.compile("(?i)hidden\\s+instruction"),
+                    RejectionReason.TOOL_POISONING_DETECTED
+            )
+    );
+
+    private static final List<ThreatPattern> INJECTION_PATTERNS = List.of(
             new ThreatPattern(
                     Pattern.compile("\\|"),
-                    "Shell pipe operator '|' detected (RULE 2)"
+                    "Shell pipe operator '|' detected (MCP05)"
             ),
             new ThreatPattern(
                     Pattern.compile("&&"),
-                    "Shell chaining operator '&&' detected (RULE 2)"
+                    "Shell chaining operator '&&' detected (MCP05)"
             ),
             new ThreatPattern(
                     Pattern.compile(";"),
-                    "Command separator ';' detected (RULE 2)"
+                    "Command separator ';' detected (MCP05)"
             ),
             new ThreatPattern(
                     Pattern.compile("(?i)rm\\s+-rf"),
-                    "Destructive 'rm -rf' pattern detected (RULE 2)"
+                    "Destructive 'rm -rf' pattern detected (MCP05)"
             ),
             new ThreatPattern(
-                    Pattern.compile("(?i)ignore\\s+(all\\s+)?(previous|prior)\\s+(instructions|prompts)"),
-                    "Prompt-injection jailbreak phrase detected (RULE 2)"
+                    Pattern.compile("(?i)\\b(bash|sh|zsh|cmd\\.exe|powershell)\\b.*(-c|/c)\\b"),
+                    RejectionReason.UNAUTHORIZED_SHELL
+            )
+    );
+
+    private static final List<ThreatPattern> PATH_TRAVERSAL_PATTERNS = List.of(
+            new ThreatPattern(
+                    Pattern.compile("(?i)/etc/passwd"),
+                    RejectionReason.PATH_TRAVERSAL
             ),
             new ThreatPattern(
-                    Pattern.compile("(?i)(system\\s*:|you\\s+are\\s+now\\s+|DAN\\s+mode)"),
-                    "Prompt-injection role-override phrase detected (RULE 2)"
+                    Pattern.compile("(?i)/etc/shadow"),
+                    RejectionReason.PATH_TRAVERSAL
+            ),
+            new ThreatPattern(
+                    Pattern.compile("\\.\\./"),
+                    RejectionReason.PATH_TRAVERSAL
+            ),
+            new ThreatPattern(
+                    Pattern.compile("\\.\\.\\\\"),
+                    RejectionReason.PATH_TRAVERSAL
+            ),
+            new ThreatPattern(
+                    Pattern.compile("(?i)%2e%2e(%2f|/)"),
+                    RejectionReason.PATH_TRAVERSAL
             )
     );
 
@@ -50,24 +102,35 @@ public final class SecurityRuleEngine {
     }
 
     /**
-     * Evaluates the payload against all security rules.
+     * Evaluates tool name + full JSON payload (schema, metadata, descriptions, arguments).
      *
-     * @param toolName       MCP tool name
-     * @param rawPayloadJson full JSON payload as string (for pattern scanning)
-     * @return empty if allowed; otherwise a blocking reason
+     * @return empty if allowed; otherwise a blocking reason suitable for audit logging
      */
     public static Optional<String> evaluate(String toolName, String rawPayloadJson) {
         if (toolName == null || toolName.isBlank()) {
             return Optional.of("Missing or empty tool_name");
         }
 
-        String normalized = toolName.trim().toLowerCase();
+        String normalized = toolName.trim().toLowerCase(Locale.ROOT);
         if (BLOCKED_TOOLS.contains(normalized)) {
-            return Optional.of("Blocked tool_name '" + toolName + "' (RULE 1: dangerous execution tools)");
+            return Optional.of(RejectionReason.UNAUTHORIZED_SHELL);
         }
 
         String haystack = rawPayloadJson != null ? rawPayloadJson : "";
-        for (ThreatPattern threat : THREAT_PATTERNS) {
+
+        for (ThreatPattern threat : POISONING_PATTERNS) {
+            if (threat.pattern().matcher(haystack).find()) {
+                return Optional.of(threat.reason());
+            }
+        }
+
+        for (ThreatPattern threat : PATH_TRAVERSAL_PATTERNS) {
+            if (threat.pattern().matcher(haystack).find()) {
+                return Optional.of(threat.reason());
+            }
+        }
+
+        for (ThreatPattern threat : INJECTION_PATTERNS) {
             if (threat.pattern().matcher(haystack).find()) {
                 return Optional.of(threat.reason());
             }

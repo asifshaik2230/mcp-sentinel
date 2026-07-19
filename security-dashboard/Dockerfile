@@ -26,4 +26,4 @@ EXPOSE 8501
 HEALTHCHECK --interval=20s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8501/_stcore/health || exit 1
 
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.enableCORS=false", "--server.enableWebsocketCompression=false"]

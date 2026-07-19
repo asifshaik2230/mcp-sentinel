@@ -1,6 +1,7 @@
 """
 MCP-Sentinel Security Dashboard
 Dark-mode Streamlit UI for live audit of intercepted MCP traffic.
+Surfaces OWASP MCP Top 10 rejection reasons (DNS rebinding, tool poisoning, FGA).
 """
 
 from __future__ import annotations
@@ -16,6 +17,15 @@ from streamlit_autorefresh import st_autorefresh
 
 PROXY_BASE_URL = os.getenv("PROXY_BASE_URL", "http://localhost:8080").rstrip("/")
 REFRESH_SECONDS = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "5"))
+
+KNOWN_REJECTION_REASONS = [
+    "DNS Rebinding Blocked",
+    "Tool Poisoning Detected",
+    "FGA Scope Violation",
+    "Path traversal or sensitive path access blocked",
+    "Unauthorized shell/bash command blocked",
+    "Missing or invalid Bearer token",
+]
 
 st.set_page_config(
     page_title="MCP-Sentinel",
@@ -38,6 +48,7 @@ st.markdown(
         --accent: #3dd6c6;
         --danger: #ff5c7a;
         --ok: #3ecf8e;
+        --warn: #f5c542;
     }
 
     .stApp {
@@ -69,6 +80,7 @@ st.markdown(
     .metric-value.ok { color: var(--ok); }
     .metric-value.danger { color: var(--danger); }
     .metric-value.accent { color: var(--accent); }
+    .metric-value.warn { color: var(--warn); }
 
     div[data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
     footer { visibility: hidden; }
@@ -110,11 +122,30 @@ def format_timestamp(value: Any) -> str:
         return str(value)
 
 
+def classify_threat(reason: str) -> str:
+    if not reason:
+        return "—"
+    r = reason.lower()
+    if "dns rebinding" in r:
+        return "DNS Rebinding"
+    if "tool poisoning" in r:
+        return "Tool Poisoning"
+    if "fga scope" in r:
+        return "FGA Violation"
+    if "path traversal" in r or "/etc/" in r:
+        return "Path Traversal"
+    if "shell" in r or "bash" in r or "mcp05" in r or "pipe" in r or "chaining" in r:
+        return "Command Injection"
+    if "bearer" in r or "unauthorized" in r or "token" in r:
+        return "Auth Failure"
+    return "Policy Block"
+
+
 st_autorefresh(interval=REFRESH_SECONDS * 1000, key="mcp_sentinel_refresh")
 
 st.markdown('<p class="hero-title">MCP-Sentinel</p>', unsafe_allow_html=True)
 st.markdown(
-    '<p class="hero-sub">Zero-Trust Agent Firewall · Live MCP traffic interception &amp; audit</p>',
+    '<p class="hero-sub">Zero-Trust Agent Firewall · OWASP MCP Top 10 defenses · Live audit</p>',
     unsafe_allow_html=True,
 )
 
@@ -135,7 +166,7 @@ except requests.RequestException as exc:
 if error_message:
     st.error(error_message)
 else:
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(
             f"""
@@ -167,44 +198,88 @@ else:
             unsafe_allow_html=True,
         )
 
+    rows = []
+    for entry in logs:
+        status = str(entry.get("status", "")).upper()
+        reason = entry.get("reason") or ""
+        # Agent ID is stamped from the authenticated Bearer token by the proxy
+        agent_id = entry.get("agentId") or entry.get("agent_id") or "—"
+        rows.append(
+            {
+                "Timestamp": format_timestamp(entry.get("timestamp")),
+                "Tool Name": entry.get("toolName") or entry.get("tool_name") or "—",
+                "Status": status,
+                "Agent ID": agent_id,
+                "Threat Class": classify_threat(reason) if status == "BLOCKED" else "—",
+                "Reason": reason,
+                "Session ID": entry.get("sessionId") or entry.get("session_id") or "—",
+                "Payload": entry.get("payload") or "",
+            }
+        )
+
+    with c4:
+        fga_count = sum(1 for r in rows if "FGA Scope Violation" in str(r.get("Reason", "")))
+        poison_count = sum(1 for r in rows if "Tool Poisoning Detected" in str(r.get("Reason", "")))
+        dns_count = sum(1 for r in rows if "DNS Rebinding Blocked" in str(r.get("Reason", "")))
+        st.markdown(
+            f"""
+            <div class="metric-card">
+              <div class="metric-label">OWASP MCP Blocks</div>
+              <div class="metric-value warn">{fga_count + poison_count + dns_count}</div>
+              <div style="color:#8b9bb8;font-size:0.75rem;margin-top:0.35rem;">
+                FGA {fga_count} · Poison {poison_count} · DNS {dns_count}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     st.markdown("### Audit Trail")
-    st.caption(f"Auto-refresh every {REFRESH_SECONDS}s · Source: {PROXY_BASE_URL}/api/audit/logs")
+    st.caption(
+        f"Auto-refresh every {REFRESH_SECONDS}s · Agent ID is resolved from Bearer token (FGA) · "
+        f"API: localhost:8080/api/audit/logs"
+    )
 
-    if not logs:
-        st.info("No intercepted MCP traffic yet. POST tool calls to `/v1/mcp/execute` to populate the audit trail.")
+    if not rows:
+        st.info(
+            "No intercepted MCP traffic yet. POST authenticated tool calls to `/v1/mcp/execute` "
+            "(Authorization: Bearer + trusted Origin/Host) to populate the audit trail."
+        )
     else:
-        rows = []
-        for entry in logs:
-            status = str(entry.get("status", "")).upper()
-            rows.append(
-                {
-                    "Timestamp": format_timestamp(entry.get("timestamp")),
-                    "Tool Name": entry.get("toolName") or entry.get("tool_name") or "—",
-                    "Status": status,
-                    "Agent ID": entry.get("agentId") or entry.get("agent_id") or "—",
-                    "Session ID": entry.get("sessionId") or entry.get("session_id") or "—",
-                    "Reason": entry.get("reason") or "",
-                    "Payload": entry.get("payload") or "",
-                }
-            )
-
         df = pd.DataFrame(rows)
 
-        filter_col, search_col = st.columns([1, 2])
+        filter_col, reason_col, search_col = st.columns([1, 1, 2])
         with filter_col:
             status_filter = st.selectbox("Status filter", options=["ALL", "ALLOWED", "BLOCKED"], index=0)
+        with reason_col:
+            reason_options = ["ALL"] + KNOWN_REJECTION_REASONS + ["Other"]
+            reason_filter = st.selectbox("Rejection reason", options=reason_options, index=0)
         with search_col:
-            query = st.text_input("Search tool / payload", placeholder="e.g. bash, read_file, rm -rf")
+            query = st.text_input(
+                "Search agent / tool / payload",
+                placeholder="e.g. agent-alpha, FGA Scope Violation, ../",
+            )
 
         view = df.copy()
         if status_filter != "ALL":
             view = view[view["Status"] == status_filter]
+        if reason_filter != "ALL":
+            if reason_filter == "Other":
+                view = view[
+                    (view["Status"] == "BLOCKED")
+                    & (~view["Reason"].isin(KNOWN_REJECTION_REASONS))
+                    & (view["Reason"].astype(str).str.len() > 0)
+                ]
+            else:
+                view = view[view["Reason"] == reason_filter]
         if query:
             q = query.lower()
             mask = (
                 view["Tool Name"].astype(str).str.lower().str.contains(q, na=False)
+                | view["Agent ID"].astype(str).str.lower().str.contains(q, na=False)
                 | view["Payload"].astype(str).str.lower().str.contains(q, na=False)
                 | view["Reason"].astype(str).str.lower().str.contains(q, na=False)
+                | view["Threat Class"].astype(str).str.lower().str.contains(q, na=False)
             )
             view = view[mask]
 
@@ -217,8 +292,10 @@ else:
                 "Timestamp": st.column_config.TextColumn("Timestamp", width="medium"),
                 "Tool Name": st.column_config.TextColumn("Tool Name", width="small"),
                 "Status": st.column_config.TextColumn("Status", width="small"),
-                "Payload": st.column_config.TextColumn("Payload", width="large"),
+                "Agent ID": st.column_config.TextColumn("Agent ID", width="small"),
+                "Threat Class": st.column_config.TextColumn("Threat Class", width="medium"),
                 "Reason": st.column_config.TextColumn("Reason", width="medium"),
+                "Payload": st.column_config.TextColumn("Payload", width="large"),
             },
         )
 

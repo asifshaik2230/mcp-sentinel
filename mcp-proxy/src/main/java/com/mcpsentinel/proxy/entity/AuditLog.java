@@ -31,7 +31,7 @@ public class AuditLog {
     @Column(nullable = false, columnDefinition = "CLOB")
     private String payload;
 
-    @Column(length = 512)
+    @Column(length = 1024)
     private String reason;
 
     @Column(name = "agent_id", length = 255)

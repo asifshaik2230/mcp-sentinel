@@ -8,6 +8,7 @@ import java.util.Map;
 
 /**
  * Incoming MCP tool-call payload intercepted by the firewall.
+ * Inspected fields include schema metadata and description (OWASP MCP03).
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class McpExecuteRequest {
@@ -16,8 +17,14 @@ public class McpExecuteRequest {
     @JsonProperty("tool_name")
     private String toolName;
 
+    @JsonProperty("description")
+    private String description;
+
     @JsonProperty("arguments")
     private Map<String, Object> arguments;
+
+    @JsonProperty("metadata")
+    private Map<String, Object> metadata;
 
     @JsonProperty("agent_id")
     private String agentId;
@@ -36,12 +43,28 @@ public class McpExecuteRequest {
         this.toolName = toolName;
     }
 
+    public String getDescription() {
+        return description;
+    }
+
+    public void setDescription(String description) {
+        this.description = description;
+    }
+
     public Map<String, Object> getArguments() {
         return arguments;
     }
 
     public void setArguments(Map<String, Object> arguments) {
         this.arguments = arguments;
+    }
+
+    public Map<String, Object> getMetadata() {
+        return metadata;
+    }
+
+    public void setMetadata(Map<String, Object> metadata) {
+        this.metadata = metadata;
     }
 
     public String getAgentId() {

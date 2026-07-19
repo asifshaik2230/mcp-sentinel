@@ -7,9 +7,13 @@ import com.mcpsentinel.proxy.dto.McpExecuteRequest;
 import com.mcpsentinel.proxy.dto.McpExecuteResponse;
 import com.mcpsentinel.proxy.entity.AuditLog;
 import com.mcpsentinel.proxy.repository.AuditLogRepository;
+import com.mcpsentinel.proxy.security.AgentContext;
+import com.mcpsentinel.proxy.security.AgentIdentity;
+import com.mcpsentinel.proxy.security.RejectionReason;
 import com.mcpsentinel.proxy.security.SecurityRuleEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -25,8 +29,6 @@ public class FirewallService {
 
     private final AuditLogRepository auditLogRepository;
     private final ObjectMapper objectMapper;
-
-    /** Approximate concurrent in-flight MCP execute calls for the dashboard metric. */
     private final AtomicInteger activeConnections = new AtomicInteger(0);
 
     public FirewallService(AuditLogRepository auditLogRepository, ObjectMapper objectMapper) {
@@ -38,23 +40,90 @@ public class FirewallService {
     public InspectionResult inspect(McpExecuteRequest request) {
         activeConnections.incrementAndGet();
         try {
-            String payloadJson = toJson(request);
+            AgentIdentity identity = AgentContext.get();
             String toolName = request.getToolName() != null ? request.getToolName() : "unknown";
 
-            Optional<String> blockReason = SecurityRuleEngine.evaluate(toolName, payloadJson);
-
-            if (blockReason.isPresent()) {
-                AuditLog audit = persist(toolName, "BLOCKED", payloadJson, blockReason.get(), request);
-                log.warn("BLOCKED tool_name={} auditId={} reason={}", toolName, audit.getId(), blockReason.get());
-                return InspectionResult.blocked(McpExecuteResponse.blocked(audit.getId(), toolName, blockReason.get()));
+            // Prefer authenticated agent identity over client-supplied agent_id
+            if (identity != null) {
+                request.setAgentId(identity.agentId());
             }
 
-            AuditLog audit = persist(toolName, "ALLOWED", payloadJson, null, request);
-            log.info("ALLOWED tool_name={} auditId={}", toolName, audit.getId());
+            String payloadJson = toJson(request);
+            String agentId = request.getAgentId();
+
+            if (identity == null) {
+                AuditLog audit = persist(toolName, "BLOCKED", payloadJson, RejectionReason.UNAUTHORIZED, agentId, request.getSessionId());
+                log.warn("BLOCKED tool_name={} auditId={} reason={}", toolName, audit.getId(), RejectionReason.UNAUTHORIZED);
+                return InspectionResult.blocked(
+                        HttpStatus.UNAUTHORIZED,
+                        McpExecuteResponse.blocked(audit.getId(), toolName, RejectionReason.UNAUTHORIZED)
+                );
+            }
+
+            // OWASP MCP07 — Fine-grained authorization (scoped tools)
+            if (!identity.mayExecute(toolName)) {
+                AuditLog audit = persist(
+                        toolName,
+                        "BLOCKED",
+                        payloadJson,
+                        RejectionReason.FGA_SCOPE_VIOLATION,
+                        identity.agentId(),
+                        request.getSessionId()
+                );
+                log.warn("BLOCKED tool_name={} agent={} auditId={} reason={}",
+                        toolName, identity.agentId(), audit.getId(), RejectionReason.FGA_SCOPE_VIOLATION);
+                return InspectionResult.blocked(
+                        HttpStatus.FORBIDDEN,
+                        McpExecuteResponse.blocked(audit.getId(), toolName, RejectionReason.FGA_SCOPE_VIOLATION)
+                );
+            }
+
+            Optional<String> blockReason = SecurityRuleEngine.evaluate(toolName, payloadJson);
+            if (blockReason.isPresent()) {
+                AuditLog audit = persist(
+                        toolName,
+                        "BLOCKED",
+                        payloadJson,
+                        blockReason.get(),
+                        identity.agentId(),
+                        request.getSessionId()
+                );
+                log.warn("BLOCKED tool_name={} agent={} auditId={} reason={}",
+                        toolName, identity.agentId(), audit.getId(), blockReason.get());
+                return InspectionResult.blocked(
+                        HttpStatus.FORBIDDEN,
+                        McpExecuteResponse.blocked(audit.getId(), toolName, blockReason.get())
+                );
+            }
+
+            AuditLog audit = persist(toolName, "ALLOWED", payloadJson, null, identity.agentId(), request.getSessionId());
+            log.info("ALLOWED tool_name={} agent={} auditId={}", toolName, identity.agentId(), audit.getId());
             return InspectionResult.allowed(McpExecuteResponse.allowed(audit.getId(), toolName));
         } finally {
             activeConnections.decrementAndGet();
         }
+    }
+
+    /**
+     * Persist a block raised by servlet filters (DNS rebinding / auth) before the controller runs.
+     */
+    @Transactional
+    public Long recordExternalBlock(
+            String toolName,
+            String reason,
+            String payloadJson,
+            String agentId,
+            String sessionId
+    ) {
+        AuditLog audit = persist(
+                toolName != null ? toolName : "unknown",
+                "BLOCKED",
+                payloadJson != null ? payloadJson : "{}",
+                reason,
+                agentId,
+                sessionId
+        );
+        return audit.getId();
     }
 
     @Transactional(readOnly = true)
@@ -77,15 +146,22 @@ public class FirewallService {
         return activeConnections.get();
     }
 
-    private AuditLog persist(String toolName, String status, String payload, String reason, McpExecuteRequest request) {
+    private AuditLog persist(
+            String toolName,
+            String status,
+            String payload,
+            String reason,
+            String agentId,
+            String sessionId
+    ) {
         AuditLog audit = new AuditLog();
         audit.setTimestamp(Instant.now());
         audit.setToolName(toolName);
         audit.setStatus(status);
         audit.setPayload(payload);
         audit.setReason(reason);
-        audit.setAgentId(request.getAgentId());
-        audit.setSessionId(request.getSessionId());
+        audit.setAgentId(agentId);
+        audit.setSessionId(sessionId);
         return auditLogRepository.save(audit);
     }
 
@@ -97,13 +173,13 @@ public class FirewallService {
         }
     }
 
-    public record InspectionResult(boolean allowed, McpExecuteResponse response) {
+    public record InspectionResult(boolean allowed, HttpStatus status, McpExecuteResponse response) {
         public static InspectionResult allowed(McpExecuteResponse response) {
-            return new InspectionResult(true, response);
+            return new InspectionResult(true, HttpStatus.OK, response);
         }
 
-        public static InspectionResult blocked(McpExecuteResponse response) {
-            return new InspectionResult(false, response);
+        public static InspectionResult blocked(HttpStatus status, McpExecuteResponse response) {
+            return new InspectionResult(false, status, response);
         }
     }
 }
